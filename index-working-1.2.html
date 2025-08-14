@@ -1,0 +1,390 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Synthwave Breakout v0.3.0 (Neon, Trail + Powerups, Varied Levels)</title>
+  <style>
+    :root { --ui: #e6e6ff; }
+    html, body { margin:0; height:100%; background:#06060a; overflow:hidden; font-family:Inter, system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    #hud { position:fixed; top:0; left:0; right:0; padding:8px 12px; display:flex; gap:16px; justify-content:space-between; align-items:center; color:var(--ui); mix-blend-mode:screen; pointer-events:none; text-shadow:0 0 8px #7af, 0 0 16px #7af; }
+    #hud .left, #hud .right { display:flex; gap:16px; align-items:center; }
+    #hud .pill { background:rgba(10,10,20,0.5); border:1px solid rgba(120,180,255,0.35); padding:6px 10px; border-radius:999px; box-shadow:0 0 12px rgba(120,180,255,0.3) inset; }
+    #menu { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:radial-gradient(ellipse at center, rgba(10,10,30,0.85), rgba(5,5,10,0.95)); color:var(--ui); flex-direction:column; gap:16px; text-align:center; }
+    #menu h1 { font-size:42px; letter-spacing:2px; text-shadow:0 0 24px #f0f; margin:0 0 6px; }
+    #menu .row{display:flex;gap:10px;flex-wrap:wrap;justify-content:center;}
+    #menu button { pointer-events:auto; padding:10px 18px; border-radius:999px; border:1px solid #7af; background:rgba(20,20,40,0.9); color:#cfe8ff; cursor:pointer; box-shadow:0 0 18px rgba(120,180,255,0.35), inset 0 0 12px rgba(255,0,255,0.25); }
+    #menu button:hover { filter:brightness(1.15); }
+    #toast { position:fixed; top:64px; left:50%; transform:translateX(-50%); color:#cfe8ff; padding:8px 14px; border-radius:999px; border:1px solid rgba(120,180,255,0.35); background:rgba(10,10,20,0.6); box-shadow:0 0 14px rgba(120,180,255,0.35); opacity:0; transition:opacity .25s ease; pointer-events:none; }
+    canvas { display:block; }
+  </style>
+
+  <!-- Import map: run from any static server, no bundler needed -->
+  <script type="importmap">
+  {
+    "imports": {
+      "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+      "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+    }
+  }
+  </script>
+</head>
+<body>
+  <div id="hud">
+    <div class="left">
+      <div class="pill" id="score">Score: 0</div>
+      <div class="pill" id="lives">Lives: 3</div>
+      <div class="pill" id="level">Level: 1</div>
+      <div class="pill" id="mult">x1.0</div>
+    </div>
+    <div class="right">
+      <div class="pill" id="hint">Space/Click: launch</div>
+    </div>
+  </div>
+
+  <div id="menu">
+    <h1>🟣 SYNTHWAVE BREAKOUT</h1>
+    <div>Move with mouse/touch. Space/Click: launch. P: pause.</div>
+    <div class="row">
+      <button id="startBtn">Start Game</button>
+      <button id="toggleBloom">Toggle Bloom</button>
+    </div>
+  </div>
+  <div id="toast">Level Up!</div>
+
+  <script type="module">
+    import * as THREE from 'three';
+    import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
+    import { RenderPass } from 'three/addons/postprocessing/RenderPass.js';
+    import { UnrealBloomPass } from 'three/addons/postprocessing/UnrealBloomPass.js';
+
+    // ---------------- Config ----------------
+    const CONFIG = {
+      WORLD: { HEIGHT: 90 }, // WIDTH is computed from aspect so we always fill width
+      PADDLE: { W: 18, H: 2.5 },
+      BALL: { R: 1.4, SPEED: 75 },
+      BRICK: { W: 8.5, H: 3.5, GUTTER_X: 1.2, GUTTER_Y: 1.0 },
+      BONUS: { LEVEL_CLEAR: 250 },
+      TRAIL: { SPAWN_DT: 0.03, LIFE: 0.5, SIZE: 2.2 },
+      POWERUPS: { FALL_SPEED: 22, CHANCE: 0.16, DURATION: 12 }
+    };
+
+    const PALETTE = [
+      new THREE.Color('#53e3fb'), // cyan
+      new THREE.Color('#ff3df5'), // magenta
+      new THREE.Color('#a96bff'), // purple
+      new THREE.Color('#78ffcb'), // neon green
+      new THREE.Color('#ffd36b')  // amber
+    ];
+
+    const SETTINGS = { bloom: true };
+
+    // ---------------- Shaders (neon) ----------------
+    const BG_VERT = /* glsl */`varying vec2 vUv; void main(){ vUv=uv; gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.0); }`;
+    const NEON_FRAG = /* glsl */`
+      precision highp float; varying vec2 vUv; uniform vec3 uColor; uniform float uTime; uniform float uHit;
+      void main(){
+        vec2 uv=vUv*2.0-1.0; float r=length(uv);
+        float rim = smoothstep(0.5, 1.0, 1.0 - r);
+        float pulse = 0.5 + 0.5*sin(uTime*8.0 + r*6.283);
+        float hit = uHit>0.0 ? exp(-uHit*4.0)*1.2 : 0.0;
+        vec3 c = uColor*(0.35 + 0.65*pulse) + uColor*rim*0.6 + vec3(hit);
+        gl_FragColor = vec4(c, 1.0);
+      }
+    `;
+
+    // ---------------- State ----------------
+    let renderer, scene, camera, composer, bloomPass;
+    const hud = {
+      menu: document.getElementById('menu'),
+      start: document.getElementById('startBtn'),
+      toggleBloom: document.getElementById('toggleBloom'),
+      score: document.getElementById('score'),
+      lives: document.getElementById('lives'),
+      level: document.getElementById('level'),
+      mult: document.getElementById('mult'),
+      toast: document.getElementById('toast')
+    };
+
+    const state = {
+      running:false, paused:false,
+      width: 160, height: CONFIG.WORLD.HEIGHT,
+      balls:[], bricks:[],
+      score:0, lives:3, level:0, mult:1,
+      paddle:null,
+      levelBuilding:false,
+      sticky:false
+    };
+
+    const rand = (a=0,b=1)=> a + Math.random()*(b-a);
+    function worldWidth(){ return state.height * (innerWidth/innerHeight); }
+
+    // Pools
+    let trailPool=[], activeTrails=[]; let powerups=[];
+
+    // ---------------- Init ----------------
+    function init(){
+      scene = new THREE.Scene();
+      camera = new THREE.OrthographicCamera(-1,1,1,-1, -100, 100);
+      camera.position.z = 10; camera.lookAt(0,0,0);
+
+      renderer = new THREE.WebGLRenderer({ antialias:true, powerPreference:'high-performance' });
+      renderer.setPixelRatio(Math.min(devicePixelRatio, 2));
+      renderer.setSize(innerWidth, innerHeight);
+      document.body.appendChild(renderer.domElement);
+
+      composer = new EffectComposer(renderer);
+      composer.addPass(new RenderPass(scene, camera));
+      bloomPass = new UnrealBloomPass(new THREE.Vector2(innerWidth, innerHeight), 0.65, 0.8, 0.85);
+      composer.addPass(bloomPass);
+
+      window.addEventListener('resize', onResize);
+      window.addEventListener('mousemove', onMouse);
+      window.addEventListener('touchmove', onTouch, {passive:false});
+      window.addEventListener('keydown', onKey);
+      window.addEventListener('mousedown', onClick);
+      window.addEventListener('touchstart', (e)=>{ e.preventDefault(); onClick(); }, {passive:false});
+
+      hud.start.addEventListener('click', startGame);
+      hud.toggleBloom.addEventListener('click', ()=>{ SETTINGS.bloom = !SETTINGS.bloom; });
+
+      onResize();
+      requestAnimationFrame(loop);
+    }
+
+    function onResize(){
+      state.height = CONFIG.WORLD.HEIGHT;
+      state.width = worldWidth();
+      camera.left = -state.width/2; camera.right = state.width/2;
+      camera.top = state.height/2; camera.bottom = -state.height/2; camera.updateProjectionMatrix();
+      renderer.setSize(innerWidth, innerHeight);
+      composer.setSize(innerWidth, innerHeight);
+      rebuildWalls();
+    }
+
+    // ---------------- Entities ----------------
+    let walls;
+
+    function rebuildWalls(){
+      if(walls){ scene.remove(walls); }
+      walls = new THREE.Group();
+      const t=2, W=state.width, H=state.height;
+      const wallMat = new THREE.MeshBasicMaterial({ color:0x151a27 });
+      const make = (w,h)=> new THREE.Mesh(new THREE.PlaneGeometry(w,h), wallMat);
+      const top = make(W,t); top.position.set(0,H/2+t/2,0); walls.add(top);
+      const bot = make(W,t); bot.position.set(0,-H/2-t/2,0); walls.add(bot);
+      const left = make(t,H); left.position.set(-W/2-t/2,0,0); walls.add(left);
+      const right = make(t,H); right.position.set(W/2+t/2,0,0); walls.add(right);
+      scene.add(walls);
+    }
+
+    function neonMat(color){ return new THREE.ShaderMaterial({ vertexShader: BG_VERT, fragmentShader: NEON_FRAG, side:THREE.DoubleSide, uniforms:{ uColor:{value:color.clone()}, uTime:{value:0}, uHit:{value:0} } }); }
+
+    function makePaddle(){
+      const g = new THREE.PlaneGeometry(CONFIG.PADDLE.W, CONFIG.PADDLE.H);
+      const m = neonMat(PALETTE[0]);
+      const mesh = new THREE.Mesh(g,m); mesh.position.set(0, -state.height/2 + 8, 0); scene.add(mesh);
+      mesh.width = CONFIG.PADDLE.W; mesh.height = CONFIG.PADDLE.H;
+      state.paddle = mesh; state.sticky=false;
+    }
+
+    function makeBall(x,y,vx=30,vy=60){
+      const g = new THREE.CircleGeometry(CONFIG.BALL.R, 24);
+      const m = new THREE.MeshBasicMaterial({ color: 0xffffff });
+      const s = new THREE.Mesh(g,m); s.position.set(x,y,0); s.userData.vel = new THREE.Vector2(vx, vy); s.userData.stuck=true; s.userData.trailClock=0; scene.add(s); state.balls.push(s);
+      return s;
+    }
+
+    function makeBrick(x,y,color){
+      const w=CONFIG.BRICK.W, h=CONFIG.BRICK.H; const g=new THREE.PlaneGeometry(w,h);
+      const m = neonMat(color);
+      const mesh = new THREE.Mesh(g,m); mesh.position.set(x,y,0); scene.add(mesh); state.bricks.push(mesh);
+      return mesh;
+    }
+
+    // Trails
+    function spawnTrail(x,y){
+      let q = trailPool.pop();
+      if(!q){
+        const g = new THREE.PlaneGeometry(CONFIG.TRAIL.SIZE, CONFIG.TRAIL.SIZE);
+        const m = new THREE.MeshBasicMaterial({ transparent:true, opacity:0.9, color:0xffffff, blending:THREE.AdditiveBlending, depthWrite:false });
+        q = new THREE.Mesh(g,m);
+      }
+      q.userData.t = 0;
+      q.rotation.z = Math.random()*Math.PI*2;
+      q.position.set(x,y,0.01);
+      scene.add(q);
+      activeTrails.push(q);
+    }
+    function recycleTrail(q){ scene.remove(q); const i=activeTrails.indexOf(q); if(i>=0) activeTrails.splice(i,1); trailPool.push(q); }
+
+    // Powerups
+    function spawnPowerup(x,y){
+      const kinds = ['PADDLE','SLOW','MULTI','STICKY','SHIELD'];
+      const kind = kinds[Math.floor(Math.random()*kinds.length)];
+      const g = new THREE.PlaneGeometry(3,3);
+      const m = new THREE.MeshBasicMaterial({ color: 0xffff66 });
+      const p = new THREE.Mesh(g,m);
+      p.position.set(x,y,0);
+      p.userData = { kind };
+      scene.add(p);
+      powerups.push(p);
+    }
+    function applyPower(kind){
+      switch(kind){
+        case 'PADDLE': state.paddle.scale.x = Math.min(1.6, state.paddle.scale.x * 1.25); break;
+        case 'SLOW': for (const b of state.balls) b.userData.vel.multiplyScalar(0.8); break;
+        case 'MULTI': {
+          const src = state.balls[0]; if(!src) break;
+          for (let i=0;i<2;i++){ const nb = makeBall(src.position.x, src.position.y, (Math.random()*2-1)*CONFIG.BALL.SPEED, CONFIG.BALL.SPEED); nb.userData.stuck=false; }
+          break;
+        }
+        case 'STICKY': state.sticky = true; setTimeout(()=> state.sticky=false, CONFIG.POWERUPS.DURATION*1000); break;
+        case 'SHIELD': /* visual when BG returns */ break;
+      }
+    }
+
+    // Level patterns
+    function buildLevel(){
+      state.levelBuilding = true;
+      for(const br of [...state.bricks]){ scene.remove(br); }
+      state.bricks.length = 0;
+
+      const W = state.width, H = state.height;
+      const baseCols = 10; const cols = baseCols;
+      const baseRows = 5 + Math.floor(state.level/2); const rows = Math.min(baseRows, 8);
+      const w=CONFIG.BRICK.W, h=CONFIG.BRICK.H, gx=CONFIG.BRICK.GUTTER_X, gy=CONFIG.BRICK.GUTTER_Y;
+      const totalW = cols*w + (cols-1)*gx; const startX = -totalW/2 + w/2; const startY = H/2 - 18;
+
+      const pattern = ['grid','checker','wings','tunnel','zigzag'][state.level%5];
+      for(let r=0;r<rows;r++){
+        for(let c=0;c<cols;c++){
+          // pattern rules
+          let skip=false;
+          if(pattern==='checker' && ((r+c)%2===1)) skip=true;
+          if(pattern==='wings' && (c<Math.abs(r-rows/2) || c>=cols-Math.abs(r-rows/2))) skip=true;
+          if(pattern==='tunnel' && (r>1 && r<rows-2 && c>1 && c<cols-2)) skip=true;
+          if(pattern==='zigzag' && ((r%2===0 && c%3===1) || (r%2===1 && c%3===2))) skip=true;
+          if(skip) continue;
+
+          const x = startX + c*(w+gx);
+          const y = startY - r*(h+gy);
+          const color = PALETTE[(r + c + state.level) % PALETTE.length];
+          makeBrick(x,y,color);
+        }
+      }
+      state.levelBuilding = false;
+    }
+
+    // ---------------- Game flow ----------------
+    function startGame(){
+      resetGame();
+      buildLevel();
+      makePaddle();
+      makeBall(state.paddle.position.x, state.paddle.position.y + 5, 20, 60);
+      state.running=true; state.paused=false; hud.menu.style.display='none';
+    }
+
+    function resetGame(){
+      state.running=false; state.paused=false; state.score=0; state.lives=3; state.mult=1; state.level=0;
+      for(const obj of [...scene.children]){ if(obj!==walls) scene.remove(obj); }
+      state.balls.length=0; state.bricks.length=0; state.paddle=null; activeTrails.length=0; trailPool.length=0; powerups.length=0; state.sticky=false;
+      updateHUD();
+    }
+
+    function updateHUD(){
+      hud.score.textContent = `Score: ${state.score}`;
+      hud.lives.textContent = `Lives: ${state.lives}`;
+      hud.level.textContent = `Level: ${state.level+1}`;
+      hud.mult.textContent = `x${state.mult.toFixed(1)}`;
+    }
+
+    function toast(msg){ hud.toast.textContent = msg; hud.toast.style.opacity = 1; setTimeout(()=> hud.toast.style.opacity = 0, 900); }
+
+    // ---------------- Input ----------------
+    function onMouse(e){ if(!state.paddle) return; const nx=(e.clientX/innerWidth)*2-1; state.paddle.position.x = THREE.MathUtils.clamp(nx*state.width/2, -state.width/2+10, state.width/2-10); }
+    function onTouch(e){ if(!state.paddle) return; const t=e.touches[0]; const nx=(t.clientX/innerWidth)*2-1; state.paddle.position.x = THREE.MathUtils.clamp(nx*state.width/2, -state.width/2+10, state.width/2-10); }
+    function onKey(e){ if(e.code==='Space'){ launch(); } if(e.code==='KeyP'){ togglePause(); } }
+    function onClick(){ launch(); }
+    function launch(){ for(const b of state.balls){ if(b.userData.stuck){ b.userData.stuck=false; } } }
+    function togglePause(){ if(!state.running) return; state.paused=!state.paused; hud.menu.style.display = state.paused? 'flex':'none'; }
+
+    // ---------------- Loop ----------------
+    let last=performance.now();
+    function loop(now){
+      requestAnimationFrame(loop);
+      const dt = Math.min(0.033, (now-last)/1000); last=now; if(!state.running || state.paused){ SETTINGS.bloom? composer.render(): renderer.render(scene,camera); return; }
+
+      // neon ticks
+      if(state.paddle){ const u=state.paddle.material.uniforms; u.uTime.value += dt; if(u.uHit.value>0) u.uHit.value = Math.max(0, u.uHit.value - dt); }
+      for(const br of state.bricks){ br.material.uniforms.uTime.value += dt; if(br.material.uniforms.uHit.value>0) br.material.uniforms.uHit.value = Math.max(0, br.material.uniforms.uHit.value - dt*2.5); }
+
+      const r = CONFIG.BALL.R, W=state.width/2, H=state.height/2;
+      for(const b of [...state.balls]){
+        if(b.userData.stuck){ b.position.x = state.paddle.position.x; b.position.y = state.paddle.position.y + 5; continue; }
+        const v=b.userData.vel; b.position.x += v.x*dt; b.position.y += v.y*dt;
+        
+        // trail spawn
+        b.userData.trailClock += dt; if(b.userData.trailClock > CONFIG.TRAIL.SPAWN_DT){ b.userData.trailClock = 0; spawnTrail(b.position.x, b.position.y); }
+
+        // walls
+        if(b.position.x<-W+r){ b.position.x=-W+r; v.x=Math.abs(v.x); }
+        if(b.position.x> W-r){ b.position.x= W-r; v.x=-Math.abs(v.x); }
+        if(b.position.y> H-r){ b.position.y= H-r; v.y=-Math.abs(v.y); }
+        if(b.position.y< -H+r){ scene.remove(b); state.balls.splice(state.balls.indexOf(b),1); continue; }
+        // paddle
+        if(aabb(state.paddle.position.x, state.paddle.position.y, state.paddle.width, state.paddle.height, b.position.x, b.position.y, r)){
+          b.position.y = state.paddle.position.y + state.paddle.height/2 + r; v.y = Math.abs(v.y);
+          const off = (b.position.x - state.paddle.position.x)/(state.paddle.width/2); v.x = THREE.MathUtils.clamp(v.x + off*40, -120, 120);
+          state.paddle.material.uniforms.uHit.value = 1.0;
+          if(state.sticky){ b.userData.stuck = true; }
+        }
+        // bricks
+        for(const brick of [...state.bricks]){
+          const w=CONFIG.BRICK.W,h=CONFIG.BRICK.H; if(!aabb(brick.position.x, brick.position.y, w,h, b.position.x, b.position.y, r)) continue;
+          const dx = (b.position.x - brick.position.x)/w; const dy=(b.position.y - brick.position.y)/h;
+          if(Math.abs(dx) > Math.abs(dy)) { v.x *= -1; } else { v.y *= -1; }
+          brick.material.uniforms.uHit.value = 1.0; 
+          scene.remove(brick); state.bricks.splice(state.bricks.indexOf(brick),1);
+          state.score += 10; updateHUD();
+          if (Math.random() < CONFIG.POWERUPS.CHANCE) spawnPowerup(brick.position.x, brick.position.y);
+          break;
+        }
+      }
+
+      // Powerups fall
+      for(const p of [...powerups]){
+        p.position.y -= CONFIG.POWERUPS.FALL_SPEED * dt;
+        if(p.position.y < -H-2){ scene.remove(p); powerups.splice(powerups.indexOf(p),1); continue; }
+        if(Math.abs(p.position.x - state.paddle.position.x) < state.paddle.width/2 && Math.abs(p.position.y - state.paddle.position.y) < state.paddle.height){
+          applyPower(p.userData.kind); scene.remove(p); powerups.splice(powerups.indexOf(p),1);
+        }
+      }
+
+      // Trail fade
+      for (const q of [...activeTrails]){ q.userData.t += dt; q.material.opacity = Math.max(0, 0.9 * (1 - q.userData.t/CONFIG.TRAIL.LIFE)); q.scale.multiplyScalar(0.985); if (q.userData.t > CONFIG.TRAIL.LIFE) recycleTrail(q); }
+
+      // life loss
+      if(state.balls.length===0){ state.lives--; state.mult=1; if(state.lives<0){ gameOver(); } else { makeBall(state.paddle.position.x, state.paddle.position.y+5, 20*(1+state.level*0.05), 60*(1+state.level*0.05)); } updateHUD(); }
+
+      // level completion
+      if(!state.levelBuilding && state.bricks.length===0 && state.running){
+        state.score += CONFIG.BONUS.LEVEL_CLEAR; state.level++; updateHUD();
+        toast(`Level ${state.level} ✓  +${CONFIG.BONUS.LEVEL_CLEAR}`);
+        buildLevel();
+        for(const b of [...state.balls]){ scene.remove(b); }
+        state.balls.length=0;
+        makeBall(state.paddle.position.x, state.paddle.position.y + 5, 20*(1+state.level*0.05), 60*(1+state.level*0.05));
+      }
+
+      SETTINGS.bloom? composer.render(): renderer.render(scene,camera);
+    }
+
+    function aabb(x,y,w,h, px,py,r){ const cx = THREE.MathUtils.clamp(px, x-w/2, x+w/2); const cy = THREE.MathUtils.clamp(py, y-h/2, y+h/2); const dx = px - cx; const dy = py - cy; return dx*dx + dy*dy <= r*r; }
+
+    function gameOver(){ state.running=false; hud.menu.style.display='flex'; hud.menu.querySelector('h1').textContent='Game Over'; }
+
+    init();
+  </script>
+</body>
+</html>
